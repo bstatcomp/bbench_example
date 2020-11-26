@@ -1,0 +1,119 @@
+---
+title: "Time-varying Bradley-Terry model using Barycentric Interpolation"
+author: "Erik Strumbelj, Blaz Krese"
+output: pdf_document
+---
+
+## Model
+
+The model is Bradley-Terry but team strength is allowed to vary over time. Latent team strength $\lambda$ is determined for each of $k$ teams at $m$ different nodes in time. The latent strengths for times between nodes ($\theta$) are interpolated using Barycentric rational interpolation. The $k$-th team is taken as the reference - its latent strength $\theta$ is assumed to be 0 always. The model also includes an additive term for home team advantage:
+
+\begin{align*}
+y_i |  \lambda, \Delta_\text{hta}, home, away, t &\sim \text{Bernoulli}\left(\frac{1}{1 + \exp(-(\theta_{home(i), t(i)} - \theta_{away(i), t(i)} + \Delta_\text{hta}))}\right) \\
+\theta_{i,t} &=  \frac{\sum_{l = 1}^m (-1)^l \lambda_{i,l} / (t - t_l) }{\sum_{l = 1}^m (-1)^l / (t - t_l))}, \forall i \neq k \\
+\theta_{k,\cdot} &= 0\\
+\lambda_i &\sim N(0, 2), \forall i \neq k \\
+\Delta_\text{hta} &\sim N(0, 1),
+\end{align*}
+
+where vectors $home(i)$/$away(i)$ and $t(i)$ are the indices of the home and away teams and the time of the $i$-th game, respectively. The prior on $\lambda$ is based on the competitive balance of the NBA - the worst team still has at least a 5-10% chance of beating the best team, which roughly coresponds to 2-3 difference in latent strength).
+
+## Example: NBA basketball
+
+```{r}
+pct_train   <- 0.50
+pct_test    <- 0.50 # the two 'pct' combined can't exceed 1.0
+n_teams     <- 3    # between 2 and 30
+nodes       <- 5
+iter_sample <- 1000
+iter_warmup <- 200
+n_chains    <- 1
+seed        <- 1
+
+df <- readRDS("NBA_dataset.rds")
+print(head(df))
+```
+
+The dataset consists of `r nrow(df)` regular season NBA games between `r min(df$Date)` and  `r max(df$Date)`. The columns include the outcome (y), an indexing of the teams (Object), the relative time in days (Time), and home and away win probabilities (Prob) derived from bookmaker odds.
+
+We'll take only the first `r n_teams` teams use `r pct_test` of the observations for training and `r pct_test` for testing. The number of interpolation nodes is set to `r nodes`. The computation time will increase substantially if we use all 30 teams and in particular if we increase the number of nodes.
+
+
+```{r}
+library(rstan)
+
+# Train/Test split
+df      <- df[df$Object_a <= n_teams & df$Object_b <= n_teams,]
+n       <- nrow(df)
+n_train <- floor(pct_train * n)
+n_test  <- floor(pct_test  * n)
+idx     <- sample(1:nrow(df), n_train + n_test, rep = F)
+idx_te  <- idx[1:n_test]
+idx_tr  <- idx[-c(1:n_test)]
+
+x_train <- df[idx_tr, colnames(df) != "y"]
+y_train <- df[idx_tr, colnames(df) == "y"]
+x_test  <- df[idx_te, colnames(df) != "y"]
+y_test  <- df[idx_te, colnames(df) == "y"]
+
+# Derived data
+objs      <- sort(unique(unlist(x_train[c("Object_a", "Object_b")])))
+tt        <- sort(unique(rbind(x_train, x_test)$Time))
+tt_train  <- sort(unique(x_train$Time))
+idx_train <- sapply(x_train$Time, function(x) which(x == tt_train)) 
+idx_test  <- sapply(x_test$Time, function(x) which(x == tt))
+t_k       <- seq(min(tt_train), max(tt_train), 
+                 (max(tt_train) - min(tt_train)) / (nodes + 1)) + pi/10
+t_k       <- t_k[c(-1, -length(t_k))]
+weights  <- (-1)^(1:length(t_k))
+
+# Prepare data for Stan
+stan_data <- list(N_teams = length(objs), n_nodes = nodes,
+                  t_k = as.array(t_k), w = as.array(weights),
+                  N_tt = length(tt), tt = tt, N_tt_train = length(tt_train),
+                  tt_train = tt_train, N_train = nrow(x_train),
+                  N_test = nrow(x_test),
+                  i_train = cbind(x_train$Object_a, x_train$Object_b),
+                  i_test = cbind(x_test$Object_a, x_test$Object_b),
+                  idx_train = as.array(idx_train),
+                  idx_test = as.array(idx_test), y = y_train)
+
+# Compile and sample
+sm  <- stan_model(file = "barycentric.stan")
+res <- sampling(sm, stan_data, iter = iter_sample,
+                warmup = iter_warmup, chains = n_chains, seed = seed,
+                control = list(max_treedepth = 20, adapt_delta = 0.8))
+
+print(res, pars = c("hta"))
+
+samples <- extract(res)
+```
+
+
+```{r}
+# visualize over time
+library(ggplot2)
+
+th_out <- samples$th
+p      <- colMeans(samples$p)
+hta    <- samples$hta
+dates  <- as.Date(df$Date[match(tt, df$Time)])
+x <- NULL
+for (i in seq(length(objs))) {
+  tmp <- t(th_out[,i,])   # No ordering, because tt is sorted
+  x <- rbind(x, data.frame(Team = df$Abbr.x[match(i, df$Object_a)], 
+                           Time = dates, 
+                           Theta = rowMeans(tmp)))
+}
+
+ggplot(x, aes(x = Time, y = Theta, group = Team, colour = Team)) + 
+  geom_line() + ylab("latent strength (posterior mean)") +
+  xlab("time")
+```
+
+## Model code
+
+```{r comment=''}
+cat(readLines('barycentric.stan'), sep = '\n')
+```
+
